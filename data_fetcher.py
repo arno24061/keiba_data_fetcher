@@ -6,117 +6,126 @@ from record_parser import JRAVanParser
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 class JRAVanFetcher:
-    """
-    JRA-VAN (JV-Link) と通信し、メモリ上にデータを取得するクラス。
-    """
+    """中央競馬(JRA-VAN)用フェッチャー"""
     def __init__(self):
         try:
             self.jv = win32com.client.Dispatch("JVDTLab.JVLink")
-        except Exception as e:
-            logging.error(f"JV-Link オブジェクト生成失敗: {e}")
+        except Exception:
             self.jv = None
             
     def init_link(self):
-        if not self.jv: return False
-        ret = self.jv.JVInit("UNKNOWN")
-        if ret != 0:
-            logging.error(f"JRA-VAN 初期化エラー (コード: {ret})")
-            return False
-        logging.info("JRA-VAN (JV-Link) 初期化成功")
-        return True
+        return self.jv is not None and self.jv.JVInit("UNKNOWN") == 0
 
     def fetch_realtime_odds(self):
         if not self.jv: return []
-        
-        data_spec = "0B31"
         today_str = datetime.datetime.now().strftime("%Y%m%d")
-        all_odds_data = []
+        all_data = []
+        logging.info(f"[JRA-VAN] 中央オッズ走査中... ({today_str})")
         
-        logging.info(f"本日の全レース(最大120R)のオッズ取得走査を開始します... ({today_str})")
-        
-        for jj in range(1, 11):
-            for rr in range(1, 13):
-                key = f"{today_str}{jj:02d}{rr:02d}"
-                
-                try:
-                    result = self.jv.JVRTOpen(data_spec, key)
-                    
-                    ret_val = result[0] if isinstance(result, tuple) else result
+        for spec in ["0B31", "0B32"]:
+            for jj in range(1, 11): # 中央の場コードは01〜10
+                for rr in range(1, 13):
+                    key = f"{today_str}{jj:02d}{rr:02d}"
                     try:
-                        ret_code = int(ret_val) if str(ret_val).strip() else 0
-                    except ValueError:
-                        ret_code = -1
-                    
-                    if ret_code < 0:
-                        continue
-                        
-                    buff = ""
-                    size = 200000
-                    filename = ""
-                    
-                    while True:
-                        read_result = self.jv.JVRead(buff, size, filename)
-                        
-                        if isinstance(read_result, tuple):
-                            read_code = read_result[0]
-                            data_str = read_result[1]
-                        else:
-                            read_code = read_result
-                            data_str = ""
+                        res = self.jv.JVRTOpen(spec, key)
+                        r_code = int(res[0] if isinstance(res, tuple) else res) if str(res[0] if isinstance(res, tuple) else res).strip() else 0
+                        if r_code < 0: continue
                             
-                        try:
-                            read_code = int(read_code)
-                        except (ValueError, TypeError):
-                            break
+                        buff, size, fname = "", 200000, ""
+                        while True:
+                            read_res = self.jv.JVRead(buff, size, fname)
+                            c, d = (read_res[0], read_res[1]) if isinstance(read_res, tuple) else (read_res, "")
+                            try: c = int(c)
+                            except: break
                             
-                        if read_code > 0:
-                            if data_str:
-                                all_odds_data.append(data_str)
-                        elif read_code == 0:
-                            break
-                        elif read_code == -1:
-                            continue
-                        else:
-                            break
-                            
-                    self.jv.JVClose()
-                    
-                except Exception as e:
-                    logging.error(f"キー {key} の通信処理で例外エラー: {e}")
-                    try:
+                            if c > 0:
+                                if d: all_data.append(d)
+                            elif c == 0: break
+                            elif c == -1: continue
+                            else: break
                         self.jv.JVClose()
-                    except:
-                        pass
-                        
-        return all_odds_data
+                    except Exception:
+                        try: self.jv.JVClose()
+                        except: pass
+        return all_data
+
+class UmaConnFetcher:
+    """地方競馬(UmaConn)用フェッチャー"""
+    def __init__(self):
+        try:
+            self.nv = win32com.client.Dispatch("NVDTLabLib.NVLink")
+        except Exception as e:
+            logging.error(f"UmaConn オブジェクト生成失敗: {e}")
+            self.nv = None
+            
+    def init_link(self):
+        if not self.nv: return False
+        if self.nv.NVInit("UNKNOWN") != 0: return False
+        logging.info("UmaConn (NV-Link) 初期化成功")
+        return True
+
+    def fetch_realtime_odds(self):
+        if not self.nv: return []
+        today_str = datetime.datetime.now().strftime("%Y%m%d")
+        all_data = []
+        logging.info(f"[UmaConn] 地方オッズ走査中... ({today_str})")
+        
+        # 地方は O1, O2 の仕様IDも中央と同一
+        for spec in ["0B31", "0B32"]:
+            # 地方の場コードは広範(帯広03〜佐賀55等)なため、1〜59を走査
+            for jj in range(1, 60):
+                for rr in range(1, 13):
+                    key = f"{today_str}{jj:02d}{rr:02d}"
+                    try:
+                        # 地方は NVRTOpen メソッドを使用する
+                        res = self.nv.NVRTOpen(spec, key)
+                        r_code = int(res[0] if isinstance(res, tuple) else res) if str(res[0] if isinstance(res, tuple) else res).strip() else 0
+                        if r_code < 0: continue
+                            
+                        buff, size, fname = "", 200000, ""
+                        while True:
+                            # 地方は NVRead メソッドを使用する
+                            read_res = self.nv.NVRead(buff, size, fname)
+                            c, d = (read_res[0], read_res[1]) if isinstance(read_res, tuple) else (read_res, "")
+                            try: c = int(c)
+                            except: break
+                            
+                            if c > 0:
+                                if d: all_data.append(d)
+                            elif c == 0: break
+                            elif c == -1: continue
+                            else: break
+                        self.nv.NVClose()
+                    except Exception:
+                        try: self.nv.NVClose()
+                        except: pass
+        return all_data
 
 if __name__ == "__main__":
-    print("=== オッズパース・テスト開始 ===")
+    print("=== 地方競馬(UmaConn) パース・テスト開始 ===")
+    uma_fetcher = UmaConnFetcher()
+    parser = JRAVanParser() # 中央と同一のパーサーを使用
     
-    jra_fetcher = JRAVanFetcher()
-    parser = JRAVanParser()
-    
-    if jra_fetcher.init_link():
-        raw_data = jra_fetcher.fetch_realtime_odds()
+    if uma_fetcher.init_link():
+        raw_data = uma_fetcher.fetch_realtime_odds()
+        logging.info(f"取得した地方競馬の有効データ: {len(raw_data)}件")
         
-        logging.info(f"取得した有効な生データ(レコード)総数: {len(raw_data)}件")
+        parsed_o1, parsed_o2 = 0, 0
         
-        if len(raw_data) > 0:
-            for record_str in raw_data:
-                # O1レコード（単勝オッズ）のみを処理対象とする
-                if record_str.startswith("O1"):
-                    parsed_data = parser.parse_o1_record(record_str)
-                    if parsed_data:
-                        r_id = parsed_data['race_id']
-                        logging.info(f"🏁 レースID: {r_id} の単勝オッズを解析しました")
-                        
-                        for umaban, info in parsed_data['win_odds'].items():
-                            print(f"  馬番 {umaban:2d} : {info['odds']:5.1f}倍 ({info['ninki']}番人気)")
-                        
-                        print("-" * 30)
-                        # テスト用：最初の1レース分を綺麗に表示したら終了
-                        break
-        else:
-            logging.info("データがありませんでした。")
-            
-    print("=== テスト終了 ===")
+        for record_str in raw_data:
+            if record_str.startswith("O1") and parsed_o1 == 0:
+                data = parser.parse_o1_record(record_str)
+                if data:
+                    print(f"\n🏁 地方レースID: {data['race_id']} 【単勝(先頭2頭)】")
+                    for u, info in list(data['win_odds'].items())[:2]: print(f"  {u:2d}番 : {info['odds']:5.1f}倍")
+                    parsed_o1 += 1
+            elif record_str.startswith("O2") and parsed_o2 == 0:
+                data = parser.parse_o2_record(record_str)
+                if data:
+                    print(f"\n🏁 地方レースID: {data['race_id']} 【馬連(先頭3組)】")
+                    for combo, info in list(data['quinella_odds'].items())[:3]: print(f"  {combo} : {info['odds']:5.1f}倍")
+                    parsed_o2 += 1
+                    
+            if parsed_o1 > 0 and parsed_o2 > 0: break
+                
+    print("\n=== テスト終了 ===")
