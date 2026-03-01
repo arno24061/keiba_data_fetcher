@@ -13,6 +13,7 @@ warnings.filterwarnings("ignore", category=UserWarning, module="cryptography")
 from record_parser import JRAVanParser
 from race_info_parser import RaceInfoParser
 from gcs_uploader import GCSUploader
+from tcs_engine import TCSEngine
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -134,7 +135,7 @@ class UmaConnFetcher(BaseFetcher):
                 except: pass
         return data
 
-def process_and_upload(raw_data, odds_parser, info_parser, uploader, source_prefix, upload_cache):
+def process_and_upload(raw_data, odds_parser, info_parser, uploader, source_prefix, upload_cache, tcs_engine):
     if not raw_data:
         return {}
 
@@ -158,8 +159,12 @@ def process_and_upload(raw_data, odds_parser, info_parser, uploader, source_pref
             parsed = info_parser.parse_record(record_str, source=source_prefix)
         elif record_type == "O1":
             parsed = odds_parser.parse_o1_record(record_str)
+            if parsed and "win_odds" in parsed and tcs_engine:
+                parsed["tcs_features"] = tcs_engine.calculate_tcs_features(parsed["race_id"], parsed["win_odds"], odds_type="O1")
         elif record_type == "O2":
             parsed = odds_parser.parse_o2_record(record_str)
+            if parsed and "quinella_odds" in parsed and tcs_engine:
+                parsed["tcs_features"] = tcs_engine.calculate_tcs_features(parsed["race_id"], parsed["quinella_odds"], odds_type="O2")
 
         # パース失敗時（地方O2など）は生文字列を強制保存し、Streamlitのパーサーに委ねる
         if not parsed:
@@ -259,6 +264,7 @@ if __name__ == "__main__":
     info_parser = RaceInfoParser()
     uploader = GCSUploader()
     upload_cache = UploadCache()  # 重複排除用キャッシュの初期化
+    tcs_engine = TCSEngine()      # TCSエンジンの初期化
     
     jra_ready = jra.init_link()
     uma_ready = uma.init_link()
@@ -277,12 +283,12 @@ if __name__ == "__main__":
         
         if jra_ready:
             jra_data = jra._fetch_rt_loop(specs_to_fetch, today_str, 10, "JRA-VAN")
-            jra_res = process_and_upload(jra_data, odds_parser, info_parser, uploader, "jra", upload_cache)
+            jra_res = process_and_upload(jra_data, odds_parser, info_parser, uploader, "jra", upload_cache, tcs_engine)
             all_results.update(jra_res)
                 
         if uma_ready:
             uma_data = uma._fetch_rt_loop_uma(specs_to_fetch, today_str, "UmaConn")
-            uma_res = process_and_upload(uma_data, odds_parser, info_parser, uploader, "nar", upload_cache)
+            uma_res = process_and_upload(uma_data, odds_parser, info_parser, uploader, "nar", upload_cache, tcs_engine)
             all_results.update(uma_res)
                 
         current_interval = determine_poll_interval(all_results)

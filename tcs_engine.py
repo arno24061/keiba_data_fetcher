@@ -64,7 +64,16 @@ class TCSEngine:
                 if not umaban_str.isdigit():
                     continue
                 try:
-                    odds_val = float(value["tansho"]) if isinstance(value, dict) and "tansho" in value else float(value)
+                    if isinstance(value, dict):
+                        if "tansho" in value:
+                            odds_val = float(value["tansho"])
+                        elif "odds" in value:
+                            odds_val = float(value["odds"])
+                        else:
+                            continue
+                    else:
+                        odds_val = float(value)
+                        
                     implied_prob = 1.0 / odds_val if odds_val > 0 else 0.0
                     sorted_odds.append({"umaban": umaban_str, "odds": odds_val, "prob": implied_prob})
                 except Exception:
@@ -111,7 +120,13 @@ class TCSEngine:
         elif odds_type == "O2":
             for pair, value in current_odds_dict.items():
                 try:
-                    odds_val = float(value["odds"]) if isinstance(value, dict) and "odds" in value else float(value)
+                    if isinstance(value, dict):
+                        if "odds" in value:
+                            odds_val = float(value["odds"])
+                        else:
+                            continue
+                    else:
+                        odds_val = float(value)
                     
                     # 時系列でのオッズ変動差分
                     odds_diff = 0.0
