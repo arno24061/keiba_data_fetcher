@@ -5,16 +5,48 @@ import time
 import os
 import json
 import warnings
+import hashlib
 
 # 32bit環境によるcryptographyのUserWarningを抑制
 warnings.filterwarnings("ignore", category=UserWarning, module="cryptography")
 
 from record_parser import JRAVanParser
 from race_info_parser import RaceInfoParser
-from tcs_engine import TCSEngine
 from gcs_uploader import GCSUploader
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+class UploadCache:
+    """
+    GCSへの無駄な重複アップロードを防ぐための状態管理クラス。
+    一度アップロードしたパスや、ペイロードのハッシュ値をローカルに記憶する。
+    """
+    def __init__(self, cache_file="upload_cache.json"):
+        self.cache_file = cache_file
+        self.cache = self._load()
+
+    def _load(self):
+        if os.path.exists(self.cache_file):
+            try:
+                with open(self.cache_file, "r", encoding="utf-8") as f:
+                    return set(json.load(f))
+            except Exception:
+                pass
+        return set()
+
+    def _save(self):
+        try:
+            with open(self.cache_file, "w", encoding="utf-8") as f:
+                json.dump(list(self.cache), f)
+        except Exception as e:
+            logging.error(f"Upload cache save error: {e}")
+
+    def is_uploaded(self, cache_key: str) -> bool:
+        return cache_key in self.cache
+
+    def mark_as_uploaded(self, cache_key: str):
+        self.cache.add(cache_key)
+        self._save()
 
 class BaseFetcher:
     def _fetch_rt_loop(self, specs, today_str, max_places, source_name):
@@ -37,12 +69,11 @@ class BaseFetcher:
                             elif c <= 0: break
                         self.close_rt()
                         spec_found += 1
-                        logging.info(f"[{source_name}] ★ 取得成功: {spec} / {key}")
                     except:
                         try: self.close_rt()
                         except: pass
             if spec_found > 0:
-                logging.info(f"[{source_name}] << {spec} 最新データの取得成功 ({spec_found}件)")
+                logging.info(f"[{source_name}] << {spec} 受信成功 ({spec_found}件)")
         return data
 
 class JRAVanFetcher(BaseFetcher):
@@ -78,15 +109,10 @@ class UmaConnFetcher(BaseFetcher):
     def close_rt(self): self.nv.NVClose()
 
     def _fetch_rt_loop_uma(self, specs, today_str, source_name):
-        """
-        地方競馬(UmaConn)専用のリアルタイム走査ループ。
-        場コードやレース番号を細かく指定せず、本日の日付だけで一括要求する仕様に適合。
-        """
         data = []
         for spec in specs:
             logging.info(f"[{source_name}] >> {spec} の最新速報を走査中...")
             try:
-                # NVRTOpenは、日付(YYYYMMDD)のみをキーにすることで本日分の全データを取得可能
                 res = self.open_rt(spec, today_str)
                 if res < 0:
                     continue
@@ -101,14 +127,14 @@ class UmaConnFetcher(BaseFetcher):
                     elif c <= 0: break
                 self.close_rt()
                 if read_count > 0:
-                    logging.info(f"[{source_name}] ★ 取得成功: {spec} ({read_count}件)")
+                    logging.info(f"[{source_name}] << {spec} 受信成功 ({read_count}件)")
             except Exception as e:
                 logging.error(f"UmaConn read error: {e}")
                 try: self.close_rt()
                 except: pass
         return data
 
-def process_and_upload(raw_data, odds_parser, info_parser, tcs_engine, uploader, source_prefix):
+def process_and_upload(raw_data, odds_parser, info_parser, uploader, source_prefix, upload_cache):
     if not raw_data:
         return {}
 
@@ -117,68 +143,85 @@ def process_and_upload(raw_data, odds_parser, info_parser, tcs_engine, uploader,
     today_str = datetime.datetime.now().strftime("%Y%m%d")
     
     for record_str in raw_data:
-        record_type = record_str[0:2]
+        if len(record_str) < 35:
+            continue
+
+        record_type = record_str[0:2].upper()
         
-        if record_type in ["O1", "O2"]:
-            parsed = odds_parser.parse_o1_record(record_str) if record_type == "O1" else odds_parser.parse_o2_record(record_str)
-            if parsed and "race_id" in parsed:
-                r_id = parsed["race_id"]
-                if r_id not in merged_data:
-                    merged_data[r_id] = {"race_id": r_id, "fetched_at": timestamp, "source": source_prefix, "race_info": {}}
-                
-                if record_type == "O2":
-                    o2_odds = parsed.get("win_odds", parsed.get("odds", {}))
-                    if o2_odds:
-                        tcs_engine.calculate_tcs_features(r_id, o2_odds, odds_type="O2")
-                elif record_type == "O1":
-                    current_odds = parsed.get("win_odds", parsed.get("odds", {}))
-                    if current_odds:
-                        tcs_features = tcs_engine.calculate_tcs_features(r_id, current_odds, odds_type="O1")
-                        merged_data[r_id]["tcs_features"] = tcs_features
+        # 発表月日時分(MMDDHHMM)を直接スライスし、時系列のキー(ファイル名)にする
+        happyo_time = record_str[27:35]
+        if not happyo_time.isdigit():
+            happyo_time = "latest"
 
-                for k, v in parsed.items():
-                    if k != "race_id": 
-                        merged_data[r_id][k] = v
-                        
-        elif record_type in ["RA", "SE", "WE", "WH"]:
+        parsed = None
+        if record_type in ["RA", "SE", "WE", "WH"]:
             parsed = info_parser.parse_record(record_str, source=source_prefix)
-            
-            # パーサーがNoneを返した場合でも、共通バイト位置(12〜27)からIDを抜き出して強制保存する安全装置
-            if not parsed:
-                if len(record_str) >= 27:
-                    r_id_raw = record_str[11:27]
-                    if r_id_raw.isdigit():
-                        parsed = {
-                            "race_id": r_id_raw,
-                            "record_type": record_type,
-                            "raw_payload": record_str
-                        }
+        elif record_type == "O1":
+            parsed = odds_parser.parse_o1_record(record_str)
+        elif record_type == "O2":
+            parsed = odds_parser.parse_o2_record(record_str)
 
-            if parsed:
-                r_id = parsed["race_id"]
-                r_type = parsed["record_type"]
-                payload = parsed["raw_payload"]
-                
-                if r_id not in merged_data:
-                    merged_data[r_id] = {"race_id": r_id, "fetched_at": timestamp, "source": source_prefix, "race_info": {}}
-                
-                if "start_time_hhmm" in parsed:
-                    merged_data[r_id]["start_time_hhmm"] = parsed["start_time_hhmm"]
-                    
-                if r_type == "SE":
-                    if "SE" not in merged_data[r_id]["race_info"]: merged_data[r_id]["race_info"]["SE"] = []
-                    merged_data[r_id]["race_info"]["SE"].append(payload)
-                else:
-                    merged_data[r_id]["race_info"][r_type] = payload
+        # パース失敗時（地方O2など）は生文字列を強制保存し、Streamlitのパーサーに委ねる
+        if not parsed:
+            r_id_raw = record_str[11:27]
+            if r_id_raw.isdigit():
+                parsed = {
+                    "race_id": r_id_raw,
+                    "record_type": record_type,
+                    "raw_payload": record_str
+                }
+
+        if parsed and "race_id" in parsed:
+            r_id = parsed["race_id"]
+            r_type = parsed.get("record_type", record_type)
+
+            if r_id not in merged_data:
+                merged_data[r_id] = {}
+            
+            # 発表時刻ごとの辞書を作成
+            if happyo_time not in merged_data[r_id]:
+                merged_data[r_id][happyo_time] = {
+                    "race_id": r_id,
+                    "fetched_at": timestamp,
+                    "happyo_time": happyo_time,
+                    "source": source_prefix,
+                    "records": {}
+                }
+
+            if r_type not in merged_data[r_id][happyo_time]["records"]:
+                merged_data[r_id][happyo_time]["records"][r_type] = []
+
+            merged_data[r_id][happyo_time]["records"][r_type].append(parsed)
 
     upload_count = 0
-    for r_id, data_dict in merged_data.items():
-        blob_name = f"odds/{source_prefix}/{today_str}/{r_id}.json"
-        if uploader.upload_json(blob_name, data_dict):
-            upload_count += 1
+    skip_count = 0
+    
+    # レースごと、発表時刻ごとに別々のファイルとしてGCSへ保存
+    for r_id, time_dict in merged_data.items():
+        for h_time, data_dict in time_dict.items():
+            blob_name = f"odds_history/{source_prefix}/{today_str}/{r_id}/{h_time}.json"
             
-    if upload_count > 0:
-        logging.info(f"[{source_prefix}] GCSアップロード完了: {upload_count}レース (TCS状態同期済)")
+            # --- 重複チェックと差分検知 ---
+            if h_time != "latest":
+                # 定刻オッズは一度アップロードすれば不変なので、パス自体をキャッシュキーにする
+                cache_key = blob_name
+            else:
+                # latestの場合は中身が変わる可能性があるため、ペイロードのハッシュ値をキーにする
+                dict_str = json.dumps(data_dict, sort_keys=True)
+                content_hash = hashlib.md5(dict_str.encode('utf-8')).hexdigest()
+                cache_key = f"{blob_name}_{content_hash}"
+
+            if upload_cache.is_uploaded(cache_key):
+                skip_count += 1
+                continue
+
+            if uploader.upload_json(blob_name, data_dict):
+                upload_cache.mark_as_uploaded(cache_key)
+                upload_count += 1
+            
+    if upload_count > 0 or skip_count > 0:
+        logging.info(f"[{source_prefix}] GCS保存状況: 新規 {upload_count}件 / 重複スキップ {skip_count}件")
+    
     return merged_data
 
 def determine_poll_interval(all_merged_data: dict) -> int:
@@ -186,15 +229,21 @@ def determine_poll_interval(all_merged_data: dict) -> int:
     imminent_race_found = False
     
     for r_id, data in all_merged_data.items():
-        st_hhmm = data.get("start_time_hhmm")
-        if not st_hhmm or not st_hhmm.isdigit() or len(st_hhmm) != 4: continue
-        try:
-            start_dt = now.replace(hour=int(st_hhmm[:2]), minute=int(st_hhmm[2:]), second=0, microsecond=0)
-            diff_seconds = (start_dt - now).total_seconds()
-            if -300 <= diff_seconds <= 900:
-                imminent_race_found = True
-                break
-        except Exception: continue
+        for h_time, time_data in data.items():
+            for r_type, records in time_data.get("records", {}).items():
+                for rec in records:
+                    st_hhmm = rec.get("start_time_hhmm")
+                    if st_hhmm and isinstance(st_hhmm, str) and st_hhmm.isdigit() and len(st_hhmm) == 4:
+                        try:
+                            start_dt = now.replace(hour=int(st_hhmm[:2]), minute=int(st_hhmm[2:]), second=0, microsecond=0)
+                            diff_seconds = (start_dt - now).total_seconds()
+                            if -300 <= diff_seconds <= 900:
+                                imminent_race_found = True
+                                break
+                        except Exception: continue
+                if imminent_race_found: break
+            if imminent_race_found: break
+        if imminent_race_found: break
             
     if imminent_race_found:
         logging.warning("⚠️ 発走15分以内のレースを検知しました。可変インターバル(30秒)に移行します。")
@@ -202,14 +251,14 @@ def determine_poll_interval(all_merged_data: dict) -> int:
     return 300
 
 if __name__ == "__main__":
-    print("=== 統合データフェッチャー (安定稼働・UmaConn対応版) 起動 ===")
+    print("=== 統合データフェッチャー (重複排除・最適化版) 起動 ===")
     
     jra = JRAVanFetcher()
     uma = UmaConnFetcher()
     odds_parser = JRAVanParser()
     info_parser = RaceInfoParser()
-    tcs_engine = TCSEngine()
     uploader = GCSUploader()
+    upload_cache = UploadCache()  # 重複排除用キャッシュの初期化
     
     jra_ready = jra.init_link()
     uma_ready = uma.init_link()
@@ -228,13 +277,12 @@ if __name__ == "__main__":
         
         if jra_ready:
             jra_data = jra._fetch_rt_loop(specs_to_fetch, today_str, 10, "JRA-VAN")
-            jra_res = process_and_upload(jra_data, odds_parser, info_parser, tcs_engine, uploader, "jra")
+            jra_res = process_and_upload(jra_data, odds_parser, info_parser, uploader, "jra", upload_cache)
             all_results.update(jra_res)
                 
         if uma_ready:
-            # UmaConnは専用の取得ループを使用する
             uma_data = uma._fetch_rt_loop_uma(specs_to_fetch, today_str, "UmaConn")
-            uma_res = process_and_upload(uma_data, odds_parser, info_parser, tcs_engine, uploader, "nar")
+            uma_res = process_and_upload(uma_data, odds_parser, info_parser, uploader, "nar", upload_cache)
             all_results.update(uma_res)
                 
         current_interval = determine_poll_interval(all_results)
