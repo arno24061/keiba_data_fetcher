@@ -1,3 +1,6 @@
 ﻿.venv/
 __pycache__/
 upload_cache.json
+build
+dist
+data_fetcher.spec
