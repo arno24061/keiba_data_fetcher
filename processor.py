@@ -140,28 +140,22 @@ def process_and_upload(raw_data, odds_parser, info_parser, uploader, source_pref
     
     return merged_data
 
-def determine_poll_interval(all_merged_data: dict) -> int:
+def extract_race_schedule(merged_data: dict) -> dict:
+    """パースされたデータから各レースの「専用キー(YYYYMMDDJJRR)」と「発走時刻」を抽出し辞書化する"""
+    schedule = {}
     now = datetime.datetime.now()
-    imminent_race_found = False
-    
-    for r_id, data in all_merged_data.items():
-        for h_time, time_data in data.items():
-            for r_type, records in time_data.get("records", {}).items():
+    for r_id, time_dict in merged_data.items():
+        for h_time, data_dict in time_dict.items():
+            for r_type, records in data_dict.get("records", {}).items():
                 for rec in records:
                     st_hhmm = rec.get("start_time_hhmm")
                     if st_hhmm and isinstance(st_hhmm, str) and st_hhmm.isdigit() and len(st_hhmm) == 4:
                         try:
                             start_dt = now.replace(hour=int(st_hhmm[:2]), minute=int(st_hhmm[2:]), second=0, microsecond=0)
-                            diff_seconds = (start_dt - now).total_seconds()
-                            if -300 <= diff_seconds <= 900:
-                                imminent_race_found = True
-                                break
-                        except Exception: continue
-                if imminent_race_found: break
-            if imminent_race_found: break
-        if imminent_race_found: break
-            
-    if imminent_race_found:
-        logging.warning("⚠️ 発走15分以内のレースを検知しました。可変インターバル(30秒)に移行します。")
-        return 30
-    return 300
+                            # 16桁のrace_id (YYYYMMDDJJKKNNRR) から、JVRTOpen用の12桁キー (YYYYMMDDJJRR) を生成
+                            if len(r_id) == 16:
+                                rt_key = r_id[0:8] + r_id[8:10] + r_id[14:16]
+                                schedule[rt_key] = start_dt
+                        except Exception: 
+                            pass
+    return schedule

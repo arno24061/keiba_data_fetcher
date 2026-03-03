@@ -4,3 +4,4 @@ upload_cache.json
 build
 dist
 data_fetcher.spec
+fetcher.log
